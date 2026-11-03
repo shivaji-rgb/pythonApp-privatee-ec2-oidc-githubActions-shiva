@@ -1,5 +1,4 @@
-
-name: Python Private EC2 Deployment
+name: Deploy Python App to Private EC2
 
 on:
   workflow_dispatch:
@@ -15,40 +14,8 @@ jobs:
     steps:
       - name: Checkout Code
         uses: actions/checkout@v4
-      - name: Debug GitHub OIDC Claims
-        shell: bash
-        run: |
-          python3 - <<'PY'
-          import os
-          import json
-          import urllib.request
-          import base64
 
-          url = os.environ["ACTIONS_ID_TOKEN_REQUEST_URL"]
-          url += "&audience=sts.amazonaws.com"
-
-          request = urllib.request.Request(
-              url,
-              headers={
-                  "Authorization": "Bearer " +
-                  os.environ["ACTIONS_ID_TOKEN_REQUEST_TOKEN"]
-              }
-          )
-
-          response = urllib.request.urlopen(request)
-          token = json.loads(response.read())["value"]
-
-          payload = token.split(".")[1]
-          payload += "=" * (-len(payload) % 4)
-
-          claims = json.loads(base64.urlsafe_b64decode(payload))
-
-          print("Issuer:", claims.get("iss"))
-          print("Audience:", claims.get("aud"))
-          print("Subject:", claims.get("sub"))
-          PY
-
-      - name: Configure AWS Credentials
+      - name: Configure AWS Credentials using OIDC
         uses: aws-actions/configure-aws-credentials@v4
         with:
           role-to-assume: arn:aws:iam::259939863830:role/github-oidc-role
@@ -57,7 +24,96 @@ jobs:
       - name: Verify AWS Identity
         run: aws sts get-caller-identity
 
-      - name: Verify SSM Access
+      - name: Package Python Application
         run: |
-          aws ssm describe-instance-information \
-            --region us-east-1
+          tar -czf app.tar.gz app.py requirements.txt
+          PAYLOAD=$(base64 -w0 app.tar.gz)
+          echo "APP_PAYLOAD=$PAYLOAD" >> "$GITHUB_ENV"
+
+      - name: Deploy Application through SSM
+        run: |
+          DEPLOY_SCRIPT=$(cat <<'SCRIPT'
+          set -e
+
+          dnf install -y python3 python3-pip
+
+          id pythonapp >/dev/null 2>&1 || useradd --system --home-dir /opt/python-app pythonapp
+
+          python3 -m venv /opt/python-app/venv
+          /opt/python-app/venv/bin/pip install --upgrade pip
+          /opt/python-app/venv/bin/pip install -r /opt/python-app/requirements.txt
+
+          chown -R pythonapp:pythonapp /opt/python-app
+
+          cat > /etc/systemd/system/python-app.service <<'EOF'
+          [Unit]
+          Description=Python Flask Application
+          After=network.target
+
+          [Service]
+          User=pythonapp
+          WorkingDirectory=/opt/python-app
+          ExecStart=/opt/python-app/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 app:app
+          Restart=always
+          RestartSec=5
+
+          [Install]
+          WantedBy=multi-user.target
+          EOF
+
+          systemctl daemon-reload
+          systemctl enable python-app
+          systemctl restart python-app
+
+          systemctl status python-app --no-pager
+          SCRIPT
+          )
+
+          COMMANDS=$(jq -cn \
+            --arg payload "$APP_PAYLOAD" \
+            --arg script "$DEPLOY_SCRIPT" \
+            '{
+              commands: [
+                "set -e",
+                "mkdir -p /opt/python-app",
+                ("echo " + $payload + " | base64 -d | tar -xz -C /opt/python-app"),
+                $script
+              ]
+            }')
+
+          COMMAND_ID=$(aws ssm send-command \
+            --instance-ids i-05179c448f3475bbe \
+            --document-name AWS-RunShellScript \
+            --parameters "$COMMANDS" \
+            --comment "Deploy Python application from GitHub Actions" \
+            --query "Command.CommandId" \
+            --output text)
+
+          echo "SSM Command ID: $COMMAND_ID"
+
+          for i in {1..30}; do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id i-05179c448f3475bbe \
+              --query "Status" \
+              --output text 2>/dev/null || true)
+
+            echo "Deployment status: $STATUS"
+
+            if [ "$STATUS" = "Success" ]; then
+              echo "Python application deployed successfully."
+              exit 0
+            fi
+
+            if [[ "$STATUS" == "Failed" || "$STATUS" == "Cancelled" || "$STATUS" == "TimedOut" ]]; then
+              aws ssm get-command-invocation \
+                --command-id "$COMMAND_ID" \
+                --instance-id i-05179c448f3475bbe
+              exit 1
+            fi
+
+            sleep 10
+          done
+
+          echo "Timed out waiting for SSM deployment."
+          exit 1
