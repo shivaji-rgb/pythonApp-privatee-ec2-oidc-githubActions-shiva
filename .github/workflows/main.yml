@@ -53,7 +53,7 @@ jobs:
           [Service]
           User=pythonapp
           WorkingDirectory=/opt/python-app
-          ExecStart=/opt/python-app/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:80 app:app
+          ExecStart=/opt/python-app/venv/bin/gunicorn --workers 2 --bind 0.0.0.0:5000 app:app
           Restart=always
           RestartSec=5
 
